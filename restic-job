@@ -1,0 +1,126 @@
+#!/bin/bash
+# Script: restic-job
+# Contexto: Wrapper de Backup Restic -> Hetzner (Append-Only)
+# Autor: Jeremias
+#
+# v0.1: Funcionamento basico do script
+# v0.2: implementacao da inteligencia para uso de --files-from
+#       bastando inderir um nome de arquivo em -o
+# v0.3: inserido opcao -r para geracao de relatorios json 
+
+
+set -euo pipefail
+
+# Credenciais e Definição do Repositório Remoto (via Rclone Wrapper)
+RESTIC_PWD_FILE="/root/.restic_pw"
+RESTIC_REPO="rclone:"
+RCLONE_PROG="ssh restic-hetzner"
+
+# Padrões
+HOST_NAME="vps-centos"
+LOG_BASE="/var/log/restic"
+COMP="auto"
+REPORT_MODE=false
+
+mkdir -p "$LOG_BASE"
+log_msg() {
+    local nivel="$1"
+    local mensagem="$2"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$nivel] $mensagem"
+}
+
+separador() {
+    echo "----------------------------------------------------------------------"
+}
+ORIGEM=""
+TAG=""
+
+while getopts "o:t:h:c:r" opt; do
+  case $opt in
+    o) ORIGEM="$OPTARG" ;;
+    t) TAG="$OPTARG" ;;
+    h) HOST_NAME="$OPTARG" ;;
+    c) COMP="$OPTARG" ;;
+    r) REPORT_MODE=true ;;
+    ?) 
+    echo "Uso: $0 -o <path> -t <tag> [-h <hostname>] [-c <modo de compactacao>] [-r]
+-o   Caminho para o backup, se apontar para um arquivo este deverá conter multiplos caminhos (diretorios);
+-t   TAG para o backup;
+-c   Modo de compactação auto é o padrão, aceita none e max
+-r   Não faz backup, apenas exporta os json para o relatorio"
+       exit 1
+       ;;
+  esac
+done
+if $REPORT_MODE; then
+    restic --password-file "$RESTIC_PWD_FILE" \
+           -r "$RESTIC_REPO" \
+           -o rclone.program="$RCLONE_PROG" \
+           stats \
+           --json \
+           > /var/www/html/www/public-html/backup/stats.json && \
+        restic --password-file "$RESTIC_PWD_FILE" \
+               -r "$RESTIC_REPO" \
+               -o rclone.program="$RCLONE_PROG" \
+               snapshots \
+               --json \
+               > /var/www/html/www/public-html/backup/snapshots.json &&
+        exit 0
+fi
+
+if [[ -z "$ORIGEM" || -z "$TAG" ]]; then
+    echo "Erro: Origem (-o) e Tag (-t) são obrigatórios."
+    exit 1
+fi
+
+# Variavel que armazenará o parametro final para o comando 'restic backup'
+# Isso melhora a clareza e evita sobrescrever a entrada bruta do usuário ($ORIGEM).
+RESTIC_SOURCE_PARAM=""
+
+if [[ -d "$ORIGEM" ]]; then
+    # Se ORIGEM e um diretório existente, usa-o diretamente
+    log_msg "INFO" "Origem identificada como diretorio: '$ORIGEM'"
+    RESTIC_SOURCE_PARAM="$ORIGEM"
+elif [[ -f "$ORIGEM" ]]; then
+    # Se ORIGEM e um arquivo regular existente (e nao um diretario),
+    # assume-se que a um arquivo para --files-from.
+    log_msg "INFO" "Origem identificada como arquivo de lista (--files-from): '$ORIGEM'"
+    # As aspas internas sao essenciais para lidar com nomes de arquivo com espacos
+    RESTIC_SOURCE_PARAM="--files-from \"$ORIGEM\""
+else
+    # Se nao é nem diretorio nem arquivo regular existente, e um erro.
+    log_msg "ERROR" "Caminho de origem inválido: '$ORIGEM' (não é diretorio nem arquivo existente)."
+    exit 1
+fi
+
+ARQUIVO_LOG="${LOG_BASE}/${TAG}.log"
+
+{
+    echo ""
+    separador
+    log_msg "START" "Backup iniciado. TAG: $TAG | HOST: $HOST_NAME"
+    log_msg "INFO"  "Origem: $ORIGEM"
+    separador
+
+
+    restic --password-file "$RESTIC_PWD_FILE" \
+           -r "$RESTIC_REPO" \
+           -o rclone.program="$RCLONE_PROG" \
+           backup $RESTIC_SOURCE_PARAM \
+           --tag "$TAG" \
+           --host "$HOST_NAME" \
+           --compression "$COMP" \
+           -v 
+
+    EXIT_CODE=$?
+
+    separador
+    if [ $EXIT_CODE -eq 0 ]; then
+        log_msg "SUCCESS" "Backup concluído com sucesso."
+    else
+        log_msg "FAILURE" "Erro crítico. Código: $EXIT_CODE"
+    fi
+    separador
+    echo ""
+
+} >> "$ARQUIVO_LOG" 2>&1
